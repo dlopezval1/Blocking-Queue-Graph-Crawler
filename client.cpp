@@ -8,6 +8,9 @@
 #include <stdexcept>
 #include "rapidjson/error/error.h"
 #include "rapidjson/reader.h"
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 
 struct ParseException : std::runtime_error, rapidjson::ParseResult {
@@ -29,6 +32,8 @@ bool debug = false;
 
 // Updated service URL
 const string SERVICE_URL = "http://hollywood-graph-crawler.bridgesuncc.org/neighbors/";
+
+
 
 // Function to HTTP ecnode parts of URLs. for instance, replace spaces with '%20' for URLs
 string url_encode(CURL* curl, string input) {
@@ -83,6 +88,51 @@ string fetch_neighbors(CURL* curl, const string& node) {
     return (res == CURLE_OK) ? response : "{}";
 }
 
+struct Node {
+    string node;
+    int depth;
+};
+
+class BlockingQueue {
+private:
+    queue<Node> q;
+    mutex m;
+    condition_variable variable;
+    bool finished = false;
+
+public:
+    void push(const Node& Node) {
+        unique_lock<mutex> lock(m);
+        if (finished) return;
+        q.push(Node);
+        variable.notify_one();
+    }
+
+    bool pop(Node& Node) {
+        unique_lock<mutex> lock(m);
+        while (q.empty() && !finished)
+            variable.wait(lock);
+
+        if (q.empty())
+            return false;
+
+        Node = q.front();
+        q.pop();
+        return true;
+    }
+
+    void shutdown() {
+        unique_lock<mutex> lock(m);
+        finished = true;
+        variable.notify_all();
+    }
+
+    bool empty() {
+        unique_lock<mutex> lock(m);
+        return q.empty();
+    }
+};
+
 // Function to parse JSON and extract neighbors
 vector<string> get_neighbors(const string& json_str) {
     vector<string> neighbors;
@@ -102,36 +152,64 @@ vector<string> get_neighbors(const string& json_str) {
 }
 
 // BFS Traversal Function
-vector<string> bfs(CURL* curl, const string& start, int depth) {
-    queue<pair<string, int>> q;
+vector<string> bfs(CURL* curl, const string& start, int maxDepth) {
+
+    BlockingQueue queue;
     unordered_set<string> visited;
     vector<string> result;
 
-    q.push({start, 0});
+    mutex visited_mutex;
+    mutex result_mutex;
+    mutex active_mutex;
+
+    int active_threads = 0;
+
+    const int NUM_THREADS = 8;
+
     visited.insert(start);
+    queue.push({start, 0});
 
-    while (!q.empty()) {
-        auto [node, level] = q.front();
-        q.pop();
+    vector<thread> workers;
 
-        if (level <= depth) {
-            result.push_back(node);
-        }
-        
-        if (level < depth) {
-	    try {
-	      for (const auto& neighbor : get_neighbors(fetch_neighbors(curl, node))) {
-                if (!visited.count(neighbor)) {
-		  visited.insert(neighbor);
-		  q.push({neighbor, level + 1});
+    for (int i = 0; i < NUM_THREADS; i++) {
+        workers.emplace_back([&]() {
+
+            CURL* thread_curl = curl_easy_init(); 
+            Node Node;
+
+            while (queue.pop(Node)) {
+
+                lock_guard<mutex> lock(active_mutex);
+                active_threads++;
+
+                lock_guard<mutex> lock(result_mutex);
+                result.push_back(Node.node);
+
+                if (Node.depth < maxDepth) {
+                    for (const auto& neighbor :get_neighbors(fetch_neighbors(thread_curl, Node.node))){
+                        lock_guard<mutex> lock(visited_mutex);
+                        if (!visited.count(neighbor)) {
+                            visited.insert(neighbor);
+                            queue.push({neighbor, Node.depth + 1});
+                        }
+                    }
                 }
-	      }
-	    } catch (const ParseException& e) {
-	      std::cerr<<"Error while fetching neighbors of: "<<node<<std::endl;
-	      throw e;
-	    }
-        }
+
+                lock_guard<mutex> lock(active_mutex);
+                active_threads--;
+
+                if (queue.empty() && active_threads == 0){
+                    queue.shutdown();
+                }
+
+            }
+            curl_easy_cleanup(thread_curl);
+        });
     }
+
+    for (auto& t : workers)
+        t.join();
+
     return result;
 }
 
@@ -156,7 +234,6 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-
     const auto start{std::chrono::steady_clock::now()};
     
     
@@ -169,6 +246,5 @@ int main(int argc, char* argv[]) {
     
     curl_easy_cleanup(curl);
 
-    
     return 0;
 }
